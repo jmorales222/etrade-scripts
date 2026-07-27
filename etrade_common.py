@@ -167,30 +167,42 @@ def build_single_leg_order(symbol, expiry, strike, order_action, quantity,
     return request_body, client_order_id
 
 
-def build_spread_order(close_leg, open_leg, quantity, price_type, limit_price=None, client_order_id=None):
+def build_spread_order(leg_a, leg_b, quantity, price_type, limit_price=None, client_order_id=None):
     """
-    close_leg / open_leg: dicts with keys symbol, expiry (date), strike, order_action
+    leg_a / leg_b: dicts with keys symbol, expiry (date), strike, order_action.
+    Order of legs matters for some E*TRADE validation rules (buy leg first
+    per error 2054) — pass the BUY leg as leg_a when in doubt.
 
-    Builds a 2-leg SPREADS order (e.g. roll: BUY_TO_CLOSE old + SELL_OPEN new).
+    Builds a 2-leg SPREADS order. Confirmed working for same-direction
+    opening spreads (e.g. SELL_OPEN short put + BUY_OPEN long put = a
+    credit spread). NOT usable for rolls (close + open combined) — that
+    was tested and rejected by E*TRADE with an undocumented error; see
+    roll_order.py, which places the close and open as two separate orders
+    instead.
 
     IMPORTANT: SPREADS orders don't use priceType LIMIT/MARKET like single-leg
-    OPTN orders do. Per E*TRADE's own SPREADS example, valid priceType values
-    here are NET_CREDIT, NET_DEBIT, or MARKET. price_type passed in should
-    already be one of those — callers decide credit vs debit based on the
-    sign of the number the user enters (positive = credit = money received,
-    negative = debit = money paid).
+    OPTN orders do. NET_CREDIT and NET_DEBIT are confirmed accepted values.
+    MARKET is accepted as a value but subject to E*TRADE's after-hours/
+    opening-minutes restriction on opening market orders (error 3029) —
+    that's a market-hours rule, not a request-shape problem. EVEN was tried
+    and rejected outright by E*TRADE (error 101, "invalid input for
+    priceType") despite being referenced in their own error-message text
+    for a different error code — don't use it. price_type passed in should
+    be NET_CREDIT, NET_DEBIT, or MARKET; callers decide credit vs debit
+    based on the sign of the number the user enters (positive = credit =
+    money received, negative = debit = money paid).
     """
     if client_order_id is None:
         client_order_id = f"cli{int(datetime.datetime.now().timestamp())}"
 
     instruments = [
         build_option_instrument(
-            close_leg["symbol"], close_leg["expiry"], close_leg["strike"],
-            close_leg["order_action"], quantity,
+            leg_a["symbol"], leg_a["expiry"], leg_a["strike"],
+            leg_a["order_action"], quantity,
         ),
         build_option_instrument(
-            open_leg["symbol"], open_leg["expiry"], open_leg["strike"],
-            open_leg["order_action"], quantity,
+            leg_b["symbol"], leg_b["expiry"], leg_b["strike"],
+            leg_b["order_action"], quantity,
         ),
     ]
 
