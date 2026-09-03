@@ -119,8 +119,12 @@ def get_spx_quote(consumer_key, consumer_secret, access_token, access_token_secr
 
 
 def find_closest_delta_put(chain_json, target_delta):
-    """Return sorted list of (strike, delta, put_data) by |delta - target|, ascending."""
-    results = []
+    """Return sorted list of (strike, delta, put_data) by |delta - target|, ascending.
+    Deduped by strike — the chain endpoint can return the same strike twice
+    (e.g. slightly different delta snapshots for the same contract); when
+    that happens we keep whichever entry is closer to target_delta so a
+    strike doesn't show up twice in ranked/context output."""
+    by_strike = {}
     pairs = chain_json.get("OptionChainResponse", {}).get("OptionPair", [])
     for pair in pairs:
         put = pair.get("Put")
@@ -131,8 +135,11 @@ def find_closest_delta_put(chain_json, target_delta):
         if delta is None:
             continue
         strike = put.get("strikePrice")
-        results.append((strike, delta, put))
+        if strike in by_strike and abs(by_strike[strike][1] - target_delta) <= abs(delta - target_delta):
+            continue
+        by_strike[strike] = (strike, delta, put)
 
+    results = list(by_strike.values())
     if not results:
         return []
 

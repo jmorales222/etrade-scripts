@@ -64,6 +64,68 @@ def pick_nearest_to_dte(expiries, target_dte):
     return min(future, key=lambda d: abs((d - today).days - target_dte))
 
 
+def find_strike_for_delta(fetch_chain_fn, spot, target_delta, initial_chain=None,
+                           max_hops=10, tolerance=0.005):
+    """
+    Find the strike closest to target_delta, re-anchoring the chain window
+    as many times as needed to actually converge — not just one retry.
+
+    fetch_chain_fn: callable(strike_price_near) -> chain_json, used for each
+        re-anchor hop (lets callers control expiry/symbol without this
+        function needing to know about auth/tokens/expiry selection).
+    spot: current underlying spot price (float).
+    target_delta: target delta, e.g. -0.16.
+    initial_chain: chain_json already fetched near spot, reused for hop 0
+        instead of double-fetching if the caller already has one.
+    Returns the ranked list from find_closest_delta_put (possibly empty).
+
+    Direction/distance for each hop is computed from the actual delta slope
+    between adjacent strikes in the current window (points of strike per
+    unit of delta), rather than guessing a fixed step or a blind midpoint —
+    a fixed-direction or midpoint guess can overshoot past the true strike
+    and then have no reliable way back (seen in testing: first bug was
+    undershoot-only correction, second bug was a midpoint guess that
+    overcorrected past the target).
+    """
+    chain = initial_chain if initial_chain is not None else fetch_chain_fn(None)
+    ranked = find_closest_delta_put(chain, target_delta)
+    hops = 0
+    seen_anchors = set()
+    while ranked and spot and hops < max_hops:
+        by_strike = sorted(ranked, key=lambda r: r[0])
+        closest_strike, closest_delta, _ = min(ranked, key=lambda r: abs(r[1] - target_delta))
+
+        if abs(closest_delta - target_delta) <= tolerance:
+            break
+
+        if len(by_strike) >= 2:
+            s_lo, d_lo, _ = by_strike[0]
+            s_hi, d_hi, _ = by_strike[-1]
+            if s_hi != s_lo and d_hi != d_lo:
+                slope = (d_hi - d_lo) / (s_hi - s_lo)  # delta per point of strike
+                delta_needed = target_delta - closest_delta
+                strike_step = delta_needed / slope
+                new_anchor = int(closest_strike + strike_step)
+            else:
+                new_anchor = int(closest_strike - (spot - closest_strike) * 0.5)
+        else:
+            new_anchor = int(closest_strike - (spot - closest_strike) * 0.5)
+
+        new_anchor = max(1, min(new_anchor, int(spot) - 1))
+
+        if new_anchor in seen_anchors:
+            break
+        seen_anchors.add(new_anchor)
+
+        chain2 = fetch_chain_fn(new_anchor)
+        ranked2 = find_closest_delta_put(chain2, target_delta)
+        if not ranked2:
+            break
+        ranked = ranked2
+        hops += 1
+    return ranked
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--short-delta", type=float, default=-0.16, help="target delta for the short (sold) put")
@@ -83,47 +145,35 @@ def main():
 
     access_token, access_token_secret = get_token(CONSUMER_KEY, CONSUMER_SECRET)
 
-    def _fetch(strike_price_near=None):
-        expiries = get_expiry_dates(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, args.symbol)
-        expiry = pick_nearest_to_dte(expiries, args.dte)
-        spot = get_spx_quote(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret)
-        chain = get_option_chain(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret,
-                                  args.symbol, expiry, strike_price_near=strike_price_near)
-        return expiry, spot, chain
+    def _fetch_spot():
+        return get_spx_quote(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret)
+
+    def _fetch_chain(expiry, strike_price_near=None):
+        return get_option_chain(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret,
+                                 args.symbol, expiry, strike_price_near=strike_price_near)
 
     try:
-        expiry, spot, chain = _fetch(strike_price_near=None)
+        expiries = get_expiry_dates(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, args.symbol)
+        expiry = pick_nearest_to_dte(expiries, args.dte)
+        spot = _fetch_spot()
+        chain = _fetch_chain(expiry, strike_price_near=None)
     except PermissionError:
         print("Cached token expired — re-authenticating...")
         if os.path.exists(TOKEN_CACHE_FILE):
             os.remove(TOKEN_CACHE_FILE)
         access_token, access_token_secret = get_token(CONSUMER_KEY, CONSUMER_SECRET)
-        expiry, spot, chain = _fetch(strike_price_near=None)
+        expiries = get_expiry_dates(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, args.symbol)
+        expiry = pick_nearest_to_dte(expiries, args.dte)
+        spot = _fetch_spot()
+        chain = _fetch_chain(expiry, strike_price_near=None)
 
     actual_dte = (expiry - datetime.date.today()).days
 
-    def _rank_and_maybe_rewiden(chain_json, target_delta):
-        """Rank strikes by closeness to target_delta; if the best match sits
-        at the low-strike edge of the window (likely cut off before reaching
-        the true target), re-anchor further out and retry once — same logic
-        proven in find_1dte_put.py."""
-        ranked = find_closest_delta_put(chain_json, target_delta)
-        if not ranked or not spot:
-            return ranked
-        by_strike = sorted(ranked, key=lambda r: r[0])
-        lowest_strike, lowest_delta, _ = by_strike[0]
-        closest_strike, closest_delta, _ = min(ranked, key=lambda r: abs(r[1] - target_delta))
-        if closest_strike == lowest_strike and abs(closest_delta - target_delta) > 0.01:
-            span = spot - lowest_strike
-            new_anchor = int(lowest_strike - span) if span > 0 else int(spot * 0.85)
-            _, _, chain2 = _fetch(strike_price_near=new_anchor)
-            ranked2 = find_closest_delta_put(chain2, target_delta)
-            if ranked2:
-                return ranked2
-        return ranked
+    def _fetch_for_hop(strike_price_near):
+        return _fetch_chain(expiry, strike_price_near=strike_price_near)
 
-    short_ranked = _rank_and_maybe_rewiden(chain, args.short_delta)
-    long_ranked = _rank_and_maybe_rewiden(chain, args.long_delta)
+    short_ranked = find_strike_for_delta(_fetch_for_hop, spot, args.short_delta, initial_chain=chain)
+    long_ranked = find_strike_for_delta(_fetch_for_hop, spot, args.long_delta, initial_chain=chain)
 
     if not short_ranked or not long_ranked:
         print("Could not find strikes with delta data. Market may be closed, or try again during RTH.")

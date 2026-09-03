@@ -50,6 +50,11 @@ def get_account_list(consumer_key, consumer_secret, access_token, access_token_s
         "GET", url, consumer_key, consumer_secret, access_token, access_token_secret
     )
     resp = requests.get(url, headers={"Authorization": header})
+    if not resp.ok:
+        print(f"\n--- E*TRADE error response ({resp.status_code}) on get_account_list ---")
+        print(f"URL: {resp.url}")
+        print(f"Body: {resp.text}")
+        print("---\n")
     resp.raise_for_status()
     return resp.json()
 
