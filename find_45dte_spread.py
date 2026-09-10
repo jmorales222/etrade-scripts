@@ -134,10 +134,28 @@ def main():
     parser.add_argument("--symbol", type=str, default="SPX", help="underlying symbol for market-data lookups — use SPX, not SPXW")
     parser.add_argument("--context", type=int, default=3, help="number of nearby strikes to show each side of each leg")
     parser.add_argument("--debug", action="store_true", help="print every strike/delta pair returned by the chain")
-    parser.add_argument("--order", action="store_true", help="after finding both legs, launch the order preview/place flow")
+    parser.add_argument("--order", action="store_true", help="after finding both legs, launch the order preview/place flow (single static limit, no walking)")
+    parser.add_argument("--walk", action="store_true", help="after finding both legs, hand them straight to the walking-limit executor (walk_spread_order.py) — no re-typing strikes")
     parser.add_argument("--order-symbol", default=None, help="symbol to use for order placement (defaults to SPXW if --symbol is SPX-based)")
     parser.add_argument("--account-last4", default="4422")
+
+    walk_group = parser.add_argument_group("--walk options (only used with --walk)")
+    walk_group.add_argument("--quantity", type=int, default=None, help="number of spreads (required with --walk)")
+    walk_group.add_argument("--floor-credit", type=float, default=None, help="absolute minimum net credit the walk will ever place")
+    walk_group.add_argument("--floor-credit-pct", type=float, default=0.85, help="minimum net credit as a fraction of cycle-1 mid (default 0.85)")
+    walk_group.add_argument("--interval", type=int, default=20, help="seconds between re-price cycles")
+    walk_group.add_argument("--patience", type=int, default=3, help="cycles at fresh mid before stepping toward the floor")
+    walk_group.add_argument("--step", type=float, default=0.05, help="credit given up per cycle once past --patience")
+    walk_group.add_argument("--max-attempts", type=int, default=6, help="hard cap on cycles before giving up")
+
     args = parser.parse_args()
+
+    if args.order and args.walk:
+        print("Specify at most one of --order or --walk, not both.")
+        sys.exit(1)
+    if args.walk and args.quantity is None:
+        print("--quantity is required when using --walk.")
+        sys.exit(1)
 
     if not CONSUMER_KEY or not CONSUMER_SECRET:
         print("Missing ETRADE_CONSUMER_KEY / ETRADE_CONSUMER_SECRET env vars.")
@@ -245,6 +263,22 @@ def main():
         for strike, delta, put in by_strike[lo:hi]:
             marker = " <== long leg" if strike == long_strike else ""
             print(f"  {strike:>10}   delta={delta:.4f}{marker}")
+
+    if args.walk:
+        from walk_spread_order import run_walk_on_strikes
+        order_symbol = args.order_symbol
+        if order_symbol is None:
+            order_symbol = "SPXW" if args.symbol.upper() == "SPX" else args.symbol
+        run_walk_on_strikes(
+            CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret,
+            args.symbol, order_symbol, expiry, short_strike, long_strike,
+            args.quantity, args.account_last4,
+            floor_credit=args.floor_credit, floor_credit_pct=(args.floor_credit_pct if args.floor_credit is None else None),
+            interval=args.interval, patience=args.patience, step=args.step,
+            max_attempts=args.max_attempts,
+            short_delta=short_delta, long_delta=long_delta,
+        )
+        return
 
     if not args.order:
         return

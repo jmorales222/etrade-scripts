@@ -260,6 +260,75 @@ def walk(consumer_key, consumer_secret, access_token, access_token_secret,
     return False
 
 
+def run_walk_on_strikes(consumer_key, consumer_secret, access_token, access_token_secret,
+                          market_data_symbol, order_symbol, expiry, short_strike, long_strike,
+                          quantity, account_last4, floor_credit=None, floor_credit_pct=None,
+                          interval=20, patience=3, step=0.05, max_attempts=6,
+                          short_delta=None, long_delta=None, confirm=True):
+    """
+    Run the confirm-and-walk flow on already-resolved strikes — the piece
+    find_45dte_spread.py --walk calls directly so strikes found there don't
+    need to be re-typed or re-looked-up here. Also used internally by this
+    module's own main() once its delta lookup (if any) has resolved strikes.
+
+    Exactly one of floor_credit / floor_credit_pct must be given, same as
+    the CLI. Returns True if filled, False otherwise (including if the
+    user declines the confirm prompt).
+    """
+    if (floor_credit is None) == (floor_credit_pct is None):
+        print("Must supply exactly one of floor_credit or floor_credit_pct.")
+        return False
+
+    print(f"\nSpread: SELL {short_strike} PUT / BUY {long_strike} PUT, {order_symbol} {expiry.isoformat()}")
+    print(f"Quantity: {quantity}")
+
+    if floor_credit is None:
+        try:
+            mid0, s_bid, s_ask, l_bid, l_ask = get_spread_mid(
+                consumer_key, consumer_secret, access_token, access_token_secret,
+                market_data_symbol, expiry, short_strike, long_strike,
+            )
+        except PermissionError:
+            access_token, access_token_secret = refresh_token_after_expiry()
+            mid0, s_bid, s_ask, l_bid, l_ask = get_spread_mid(
+                consumer_key, consumer_secret, access_token, access_token_secret,
+                market_data_symbol, expiry, short_strike, long_strike,
+            )
+        if mid0 is None:
+            print("Could not fetch an opening quote to compute a percent-based floor "
+                  "(market may be closed). Use an absolute floor_credit instead.")
+            return False
+        floor_credit = round(mid0 * floor_credit_pct, 2)
+        print(f"Opening mid: {mid0}   Floor ({floor_credit_pct*100:.0f}% of opening mid): {floor_credit}")
+    else:
+        print(f"Floor credit: {floor_credit}")
+
+    print(f"\nWalk plan: fresh mid for cycles 1-{patience}, then step down {step}/cycle, "
+          f"never below {floor_credit}. {interval}s between cycles, max {max_attempts} cycles.")
+
+    if confirm:
+        ans = input('\nType "yes" to start the walk, anything else to cancel: ').strip().lower()
+        if ans != "yes":
+            print("Not started.")
+            return False
+
+    account = select_account(consumer_key, consumer_secret, access_token, access_token_secret, account_last4)
+    account_id_key = account["accountIdKey"]
+
+    filled = walk(
+        consumer_key, consumer_secret, access_token, access_token_secret,
+        account_id_key, market_data_symbol, order_symbol, expiry,
+        short_strike, long_strike, quantity, floor_credit,
+        interval, patience, step, max_attempts,
+        short_delta=short_delta, long_delta=long_delta,
+        account_last4=account_last4,
+    )
+
+    if not filled:
+        print("\nWalk ended without a fill. No working order remains open.")
+    return filled
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -353,54 +422,15 @@ def main():
                   "a degenerate spread. Try again (market data may have been incomplete this run).")
             sys.exit(1)
 
-    print(f"\nSpread: SELL {short_strike} PUT / BUY {long_strike} PUT, {order_symbol} {expiry.isoformat()}")
-    print(f"Quantity: {args.quantity}")
-
-    # Establish floor. If pct-based, we need cycle-1 mid first.
-    floor_credit = args.floor_credit
-    if floor_credit is None:
-        try:
-            mid0, s_bid, s_ask, l_bid, l_ask = get_spread_mid(
-                CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret,
-                market_data_symbol, expiry, short_strike, long_strike,
-            )
-        except PermissionError:
-            access_token, access_token_secret = refresh_token_after_expiry()
-            mid0, s_bid, s_ask, l_bid, l_ask = get_spread_mid(
-                CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret,
-                market_data_symbol, expiry, short_strike, long_strike,
-            )
-        if mid0 is None:
-            print("Could not fetch an opening quote to compute a percent-based floor "
-                  "(market may be closed). Use --floor-credit with an absolute value instead.")
-            sys.exit(1)
-        floor_credit = round(mid0 * args.floor_credit_pct, 2)
-        print(f"Opening mid: {mid0}   Floor ({args.floor_credit_pct*100:.0f}% of opening mid): {floor_credit}")
-    else:
-        print(f"Floor credit: {floor_credit}")
-
-    print(f"\nWalk plan: fresh mid for cycles 1-{args.patience}, then step down {args.step}/cycle, "
-          f"never below {floor_credit}. {args.interval}s between cycles, max {args.max_attempts} cycles.")
-
-    confirm = input('\nType "yes" to start the walk, anything else to cancel: ').strip().lower()
-    if confirm != "yes":
-        print("Not started.")
-        return
-
-    account = select_account(CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret, args.account_last4)
-    account_id_key = account["accountIdKey"]
-
-    filled = walk(
+    run_walk_on_strikes(
         CONSUMER_KEY, CONSUMER_SECRET, access_token, access_token_secret,
-        account_id_key, market_data_symbol, order_symbol, expiry,
-        short_strike, long_strike, args.quantity, floor_credit,
-        args.interval, args.patience, args.step, args.max_attempts,
+        market_data_symbol, order_symbol, expiry, short_strike, long_strike,
+        args.quantity, args.account_last4,
+        floor_credit=args.floor_credit, floor_credit_pct=args.floor_credit_pct,
+        interval=args.interval, patience=args.patience, step=args.step,
+        max_attempts=args.max_attempts,
         short_delta=short_delta_found, long_delta=long_delta_found,
-        account_last4=args.account_last4,
     )
-
-    if not filled:
-        print("\nWalk ended without a fill. No working order remains open.")
 
 
 if __name__ == "__main__":
